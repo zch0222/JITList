@@ -131,7 +131,9 @@ func (d *JIT) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*m
 	targetFilePath := filepath.Join(actualPath, jFile.Name)
 	log.Infof("JIT checking if file exists at: %s", targetFilePath)
 
+	_, _ = op.List(ctx, storage, actualPath, model.ListArgs{Refresh: true})
 	existingObj, err := op.GetUnwrap(ctx, storage, targetFilePath)
+
 	if err == nil {
 		// 文件已存在
 		log.Infof("JIT file already exists: %s", existingObj.GetPath())
