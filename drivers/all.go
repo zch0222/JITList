@@ -41,6 +41,7 @@ import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/halalcloud_open"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/ilanzou"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/ipfs_api"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/jit"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/kodbox"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/lanzou"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/lenovonas_share"

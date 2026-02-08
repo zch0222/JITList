@@ -211,6 +211,15 @@ func (d *PikPak) Remove(ctx context.Context, obj model.Obj) error {
 	return err
 }
 
+func (d *PikPak) HardRemove(ctx context.Context, obj model.Obj) error {
+	_, err := d.request("https://api-drive.mypikpak.net/drive/v1/files:batchDelete", http.MethodPost, func(req *resty.Request) {
+		req.SetContext(ctx).SetBody(base.Json{
+			"ids": []string{obj.GetID()},
+		})
+	}, nil)
+	return err
+}
+
 func (d *PikPak) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
 	sha1Str := stream.GetHash().GetHash(hash_extend.GCID)
 
@@ -368,6 +377,19 @@ func (d *PikPak) DeleteOfflineTasks(ctx context.Context, taskIDs []string, delet
 		return fmt.Errorf("failed to delete tasks %v: %w", taskIDs, err)
 	}
 	return nil
+}
+
+// GetOfflineTask returns the status of a specific offline task
+func (d *PikPak) GetOfflineTask(ctx context.Context, taskID string) (*OfflineTask, error) {
+	url := fmt.Sprintf("https://api-drive.mypikpak.net/drive/v1/tasks/%s", taskID)
+	var resp OfflineTask
+	_, err := d.request(url, http.MethodGet, func(req *resty.Request) {
+		req.SetContext(ctx)
+	}, &resp)
+	if err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
 var _ driver.Driver = (*PikPak)(nil)
