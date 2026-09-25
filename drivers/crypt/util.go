@@ -2,7 +2,6 @@ package crypt
 
 import (
 	stdpath "path"
-	"path/filepath"
 	"strings"
 )
 
@@ -22,8 +21,8 @@ func guessPath(path string) (isFolder, secondTry bool) {
 
 func (d *Crypt) encryptPath(path string, isFolder bool) string {
 	if isFolder {
-		return d.cipher.EncryptDirName(path)
+		return d.shortenDirPathSegments(d.cipher.EncryptDirName(path))
 	}
-	dir, fileName := filepath.Split(path)
-	return stdpath.Join(d.cipher.EncryptDirName(dir), d.cipher.EncryptFileName(fileName))
+	dir, fileName := stdpath.Split(path)
+	return stdpath.Join(d.shortenDirPathSegments(d.cipher.EncryptDirName(dir)), d.shortenFileName(d.cipher.EncryptFileName(fileName)))
 }

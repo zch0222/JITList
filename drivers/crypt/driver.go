@@ -31,6 +31,8 @@ type Crypt struct {
 	model.Storage
 	Addition
 	cipher *rcCrypt.Cipher
+	fileIO fileIO
+	idxMu  sync.Mutex
 }
 
 const obfuscatedPrefix = "___Obfuscated___"
@@ -61,6 +63,12 @@ func (d *Crypt) Init(ctx context.Context) error {
 	d.FileNameEncoding = utils.GetNoneEmpty(d.FileNameEncoding, "base64")
 	d.EncryptedSuffix = utils.GetNoneEmpty(d.EncryptedSuffix, ".bin")
 	d.RemotePath = utils.FixAndCleanPath(d.RemotePath)
+	if d.FileNameLengthLimit < 0 {
+		return fmt.Errorf("filename_length_limit must be >= 0")
+	}
+	if d.FileNameLengthLimit > 0 && d.FileNameLengthLimit < minFileNameLengthLimit {
+		return fmt.Errorf("filename_length_limit must be 0 (disabled) or at least %d", minFileNameLengthLimit)
+	}
 
 	p, _ := strings.CutPrefix(d.Password, obfuscatedPrefix)
 	p2, _ := strings.CutPrefix(d.Salt, obfuscatedPrefix)
@@ -78,6 +86,7 @@ func (d *Crypt) Init(ctx context.Context) error {
 		return fmt.Errorf("failed to create Cipher: %w", err)
 	}
 	d.cipher = c
+	d.fileIO = fsIO{}
 
 	return nil
 }
@@ -108,49 +117,27 @@ func (d *Crypt) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([
 		return nil, err
 	}
 
-	result := make([]model.Obj, 0, len(objs))
-	for _, obj := range objs {
-		size := obj.GetSize()
-		mask := model.GetObjMask(obj)
-		name := obj.GetName()
-		if mask&model.Virtual == 0 {
-			if obj.IsDir() {
-				name, err = d.cipher.DecryptDirName(model.UnwrapObjName(obj).GetName())
-				if err != nil {
-					// filter illegal files
-					continue
-				}
-			} else {
-				size, err = d.cipher.DecryptedSize(size)
-				if err != nil {
-					// filter illegal files
-					continue
-				}
-				name, err = d.cipher.DecryptFileName(model.UnwrapObjName(obj).GetName())
-				if err != nil {
-					// filter illegal files
-					continue
-				}
-			}
-		}
-		if !d.ShowHidden && strings.HasPrefix(name, ".") {
+	resolved := d.resolveListing(ctx, remoteFullPath, objs)
+	result := make([]model.Obj, 0, len(resolved))
+	for _, r := range resolved {
+		if !d.ShowHidden && strings.HasPrefix(r.name, ".") {
 			continue
 		}
 		objRes := &model.Object{
-			Path:     stdpath.Join(remoteFullPath, obj.GetName()),
-			Name:     name,
-			Size:     size,
-			Modified: obj.ModTime(),
-			IsFolder: obj.IsDir(),
-			Ctime:    obj.CreateTime(),
-			Mask:     mask &^ model.Temp,
+			Path:     stdpath.Join(remoteFullPath, r.remote.GetName()),
+			Name:     r.name,
+			Size:     r.size,
+			Modified: r.remote.ModTime(),
+			IsFolder: r.remote.IsDir(),
+			Ctime:    r.remote.CreateTime(),
+			Mask:     model.GetObjMask(r.remote) &^ model.Temp,
 			// discarding hash as it's encrypted
 		}
 		if !d.Thumbnail || !strings.HasPrefix(args.ReqPath, "/") {
 			result = append(result, objRes)
 			continue
 		}
-		thumbPath := stdpath.Join(args.ReqPath, ".thumbnails", name+".webp")
+		thumbPath := stdpath.Join(args.ReqPath, ".thumbnails", r.name+".webp")
 		thumb := fmt.Sprintf("%s/d%s?sign=%s",
 			common.GetApiUrl(ctx),
 			utils.EncodePath(thumbPath, true),
@@ -205,19 +192,11 @@ func (d *Crypt) Get(ctx context.Context, path string) (model.Obj, error) {
 			} else {
 				size = decryptedSize
 			}
-			decryptedName, err := d.cipher.DecryptFileName(model.UnwrapObjName(remoteObj).GetName())
-			if err != nil {
-				log.Warnf("DecryptFileName failed for %s ,will use original name, err:%s", path, err)
-			} else {
-				name = decryptedName
-			}
+		}
+		if decryptedName, err := d.decryptRemoteName(ctx, remoteFullPath, model.UnwrapObjName(remoteObj).GetName(), remoteObj.IsDir()); err == nil {
+			name = decryptedName
 		} else {
-			decryptedName, err := d.cipher.DecryptDirName(model.UnwrapObjName(remoteObj).GetName())
-			if err != nil {
-				log.Warnf("DecryptDirName failed for %s ,will use original name, err:%s", path, err)
-			} else {
-				name = decryptedName
-			}
+			log.Warnf("DecryptName failed for %s ,will use original name, err:%s", path, err)
 		}
 	}
 	return &model.Object{
@@ -315,12 +294,44 @@ func (d *Crypt) MakeDir(ctx context.Context, parentDir model.Obj, dirName string
 	if err != nil {
 		return err
 	}
-	encryptedName := d.cipher.EncryptDirName(dirName)
-	return op.MakeDir(ctx, remoteStorage, stdpath.Join(remoteActualPath, encryptedName))
+	encName := d.cipher.EncryptDirName(dirName)
+	finalName := d.shortenDirName(encName)
+	if finalName != encName {
+		// register before creating: a stale entry is harmless, while an
+		// unindexed short name would make the directory invisible
+		if err := d.addIndexEntry(ctx, remoteActualPath, finalName, encName); err != nil {
+			return fmt.Errorf("failed to update name index: %w", err)
+		}
+	}
+	return op.MakeDir(ctx, remoteStorage, stdpath.Join(remoteActualPath, finalName))
 }
 
 func (d *Crypt) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
-	_, err := fs.Move(ctx, srcObj.GetPath(), dstDir.GetPath())
+	srcPath := srcObj.GetPath()
+	srcDir := stdpath.Clean(stdpath.Dir(srcPath))
+	srcName := stdpath.Base(srcPath)
+	dstDirPath := dstDir.GetPath()
+	// when moving an entry stored under a short name, the index entry must
+	// follow it to the destination directory
+	if d.fileShorteningActive() && srcDir != dstDirPath && isShortName(srcName) {
+		encName, err := d.lookupIndexEntry(ctx, srcDir, srcName)
+		if err != nil {
+			log.Warnf("crypt: failed to load name index of %s: %v", srcDir, err)
+		}
+		if encName != "" {
+			if err := d.addIndexEntry(ctx, dstDirPath, srcName, encName); err != nil {
+				return fmt.Errorf("failed to update name index: %w", err)
+			}
+			if _, err := fs.Move(ctx, srcPath, dstDirPath); err != nil {
+				return err
+			}
+			if err := d.removeIndexEntry(ctx, srcDir, srcName); err != nil {
+				log.Warnf("crypt: failed to remove stale index entry %s: %v", srcName, err)
+			}
+			return nil
+		}
+	}
+	_, err := fs.Move(ctx, srcPath, dstDirPath)
 	return err
 }
 
@@ -329,17 +340,52 @@ func (d *Crypt) Rename(ctx context.Context, srcObj model.Obj, newName string) er
 	if err != nil {
 		return err
 	}
-	var newEncryptedName string
+	dirPath := stdpath.Dir(remoteActualPath)
+	oldName := stdpath.Base(remoteActualPath)
+	var encName, finalName string
 	if srcObj.IsDir() {
-		newEncryptedName = d.cipher.EncryptDirName(newName)
+		encName = d.cipher.EncryptDirName(newName)
+		finalName = d.shortenDirName(encName)
 	} else {
-		newEncryptedName = d.cipher.EncryptFileName(newName)
+		encName = d.cipher.EncryptFileName(newName)
+		finalName = d.shortenFileName(encName)
 	}
-	return op.Rename(ctx, remoteStorage, remoteActualPath, newEncryptedName)
+	if finalName != encName {
+		// register the new short name before the rename; the old entry is
+		// kept until the rename succeeds so a failure stays reversible
+		if err := d.addIndexEntry(ctx, dirPath, finalName, encName); err != nil {
+			return fmt.Errorf("failed to update name index: %w", err)
+		}
+	}
+	if err := op.Rename(ctx, remoteStorage, remoteActualPath, finalName); err != nil {
+		return err
+	}
+	if oldName != finalName && isShortName(oldName) {
+		if err := d.removeIndexEntry(ctx, dirPath, oldName); err != nil {
+			log.Warnf("crypt: failed to remove stale index entry %s: %v", oldName, err)
+		}
+	}
+	return nil
 }
 
 func (d *Crypt) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
-	_, err := fs.Copy(ctx, srcObj.GetPath(), dstDir.GetPath())
+	srcPath := srcObj.GetPath()
+	dstDirPath := dstDir.GetPath()
+	if d.fileShorteningActive() {
+		if srcName := stdpath.Base(srcPath); isShortName(srcName) {
+			encName, err := d.lookupIndexEntry(ctx, stdpath.Dir(srcPath), srcName)
+			if err != nil {
+				log.Warnf("crypt: failed to load name index of %s: %v", stdpath.Dir(srcPath), err)
+			}
+			if encName != "" {
+				// a stale entry is harmless if the copy fails
+				if err := d.addIndexEntry(ctx, dstDirPath, srcName, encName); err != nil {
+					return fmt.Errorf("failed to update name index: %w", err)
+				}
+			}
+		}
+	}
+	_, err := fs.Copy(ctx, srcPath, dstDirPath)
 	return err
 }
 
@@ -348,7 +394,17 @@ func (d *Crypt) Remove(ctx context.Context, obj model.Obj) error {
 	if err != nil {
 		return err
 	}
-	return op.Remove(ctx, remoteStorage, remoteActualPath)
+	if err := op.Remove(ctx, remoteStorage, remoteActualPath); err != nil {
+		return err
+	}
+	if d.fileShorteningActive() {
+		if name := stdpath.Base(remoteActualPath); isShortName(name) {
+			if err := d.removeIndexEntry(ctx, stdpath.Dir(remoteActualPath), name); err != nil {
+				log.Warnf("crypt: failed to remove index entry of %s: %v", name, err)
+			}
+		}
+	}
+	return nil
 }
 
 func (d *Crypt) Put(ctx context.Context, dstDir model.Obj, streamer model.FileStreamer, up driver.UpdateProgress) error {
@@ -363,12 +419,22 @@ func (d *Crypt) Put(ctx context.Context, dstDir model.Obj, streamer model.FileSt
 		return fmt.Errorf("failed to EncryptData: %w", err)
 	}
 
+	encName := d.cipher.EncryptFileName(streamer.GetName())
+	finalName := d.shortenFileName(encName)
+	if finalName != encName {
+		// register before upload: a stale entry is harmless, while an
+		// unindexed short name would make the upload invisible
+		if err := d.addIndexEntry(ctx, remoteActualPath, finalName, encName); err != nil {
+			return fmt.Errorf("failed to update name index: %w", err)
+		}
+	}
+
 	// doesn't support seekableStream, since rapid-upload is not working for encrypted data
 	streamOut := &stream.FileStream{
 		Obj: &model.Object{
 			ID:       streamer.GetID(),
 			Path:     streamer.GetPath(),
-			Name:     d.cipher.EncryptFileName(streamer.GetName()),
+			Name:     finalName,
 			Size:     d.cipher.EncryptedSize(streamer.GetSize()),
 			Modified: streamer.ModTime(),
 			IsFolder: streamer.IsDir(),
