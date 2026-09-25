@@ -15,7 +15,7 @@ type Addition struct {
 	EncryptedSuffix  string `json:"encrypted_suffix" required:"true" default:".bin" help:"for advanced user only! encrypted files will have this suffix"`
 	FileNameEncoding string `json:"filename_encoding" type:"select" required:"true" options:"base64,base32,base32768" default:"base64" help:"for advanced user only!"`
 
-	FileNameLengthLimit int `json:"filename_length_limit" type:"number" required:"false" default:"255" help:"when an encrypted name exceeds this length, a hashed short name is stored and the mapping is kept in a per-directory encrypted index file (opcrypt.idx) on the remote, so it works across reinstalls; 0 disables shortening. shortened entries are only readable via OpenList"`
+	FileNameShorten bool `json:"filename_shorten" required:"false" default:"false" help:"store every encrypted name under a hashed short name and keep the mapping in a per-directory encrypted index file (opcrypt.idx) on the remote, so it works across reinstalls; shortened entries are only readable via OpenList"`
 
 	Thumbnail bool `json:"thumbnail" required:"true" default:"false" help:"enable thumbnail which pre-generated under .thumbnails folder"`
 

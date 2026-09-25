@@ -23,17 +23,16 @@ import (
 
 const nameEncOff = "off"
 
-// When the encrypted name would exceed the storage's filename length limit,
-// the file is stored under a short name: "!" + 24 hex chars derived from the
-// SHA-256 of the full encrypted name. The mapping back to the encrypted name
-// is kept in a per-directory index file, so it survives OpenList reinstalls.
+// When name shortening is enabled, every encrypted name is stored under a
+// short name: "!" + 24 hex chars derived from the SHA-256 of the full
+// encrypted name. The mapping back to the encrypted name is kept in a
+// per-directory index file, so it survives OpenList reinstalls.
 const (
-	indexFileName          = "opcrypt.idx"
-	shortNamePrefix        = "!"
-	shortNameHexChars      = 24
-	shortNameTotalLen      = 1 + shortNameHexChars
-	minFileNameLengthLimit = shortNameTotalLen
-	indexVersion           = 1
+	indexFileName     = "opcrypt.idx"
+	shortNamePrefix   = "!"
+	shortNameHexChars = 24
+	shortNameTotalLen = 1 + shortNameHexChars
+	indexVersion      = 1
 )
 
 var shortNameRe = regexp.MustCompile(`^![0-9a-f]{` + fmt.Sprint(shortNameHexChars) + `}$`)
@@ -214,22 +213,26 @@ func (d *Crypt) lookupIndexEntry(ctx context.Context, remoteDir, shortKey string
 // filename encryption off the plain name is stored, and a short name would
 // never be attempted on decryption
 func (d *Crypt) fileShorteningActive() bool {
-	return d.FileNameEnc != nameEncOff && d.FileNameLengthLimit > 0
+	return d.FileNameShorten && d.FileNameEnc != nameEncOff
 }
 
 func (d *Crypt) dirShorteningActive() bool {
 	return d.fileShorteningActive() && d.DirNameEnc == "true"
 }
 
+// shortenFileName maps an encrypted file name to its short name when the
+// shortening switch is on
 func (d *Crypt) shortenFileName(encName string) string {
-	if !d.fileShorteningActive() || len(encName) <= d.FileNameLengthLimit {
+	if !d.fileShorteningActive() {
 		return encName
 	}
 	return shortName(encName)
 }
 
+// shortenDirName maps an encrypted directory name to its short name when the
+// shortening switch is on
 func (d *Crypt) shortenDirName(encName string) string {
-	if !d.dirShorteningActive() || len(encName) <= d.FileNameLengthLimit {
+	if !d.dirShorteningActive() {
 		return encName
 	}
 	return shortName(encName)
@@ -242,7 +245,7 @@ func (d *Crypt) shortenDirPathSegments(encPath string) string {
 	}
 	segments := strings.Split(encPath, "/")
 	for i, seg := range segments {
-		if len(seg) > d.FileNameLengthLimit {
+		if seg != "" {
 			segments[i] = shortName(seg)
 		}
 	}

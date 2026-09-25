@@ -63,12 +63,6 @@ func (d *Crypt) Init(ctx context.Context) error {
 	d.FileNameEncoding = utils.GetNoneEmpty(d.FileNameEncoding, "base64")
 	d.EncryptedSuffix = utils.GetNoneEmpty(d.EncryptedSuffix, ".bin")
 	d.RemotePath = utils.FixAndCleanPath(d.RemotePath)
-	if d.FileNameLengthLimit < 0 {
-		return fmt.Errorf("filename_length_limit must be >= 0")
-	}
-	if d.FileNameLengthLimit > 0 && d.FileNameLengthLimit < minFileNameLengthLimit {
-		return fmt.Errorf("filename_length_limit must be 0 (disabled) or at least %d", minFileNameLengthLimit)
-	}
 
 	p, _ := strings.CutPrefix(d.Password, obfuscatedPrefix)
 	p2, _ := strings.CutPrefix(d.Salt, obfuscatedPrefix)

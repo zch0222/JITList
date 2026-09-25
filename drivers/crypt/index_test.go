@@ -63,13 +63,13 @@ func testCipher(t *testing.T, mode, dirEnc, password string) *rcCrypt.Cipher {
 	return c
 }
 
-func newTestCrypt(t *testing.T, mode, dirEnc string, limit int, io fileIO) *Crypt {
+func newTestCrypt(t *testing.T, mode, dirEnc string, shorten bool, io fileIO) *Crypt {
 	t.Helper()
 	return &Crypt{
 		Addition: Addition{
-			FileNameEnc:         mode,
-			DirNameEnc:          dirEnc,
-			FileNameLengthLimit: limit,
+			FileNameEnc:     mode,
+			DirNameEnc:      dirEnc,
+			FileNameShorten: shorten,
 		},
 		cipher: testCipher(t, mode, dirEnc, "password"),
 		fileIO: io,
@@ -102,33 +102,33 @@ func TestShortNameFormat(t *testing.T) {
 }
 
 func TestShortenName(t *testing.T) {
-	long := strings.Repeat("超", 100) + ".txt" // 100 CJK chars => far over 255 after encryption
-	encLong := testCipher(t, "standard", "false", "password").EncryptFileName(long)
-	if len(encLong) <= 255 {
-		t.Fatalf("test name too short: %d", len(encLong))
-	}
+	encLong := testCipher(t, "standard", "false", "password").EncryptFileName(strings.Repeat("超", 100) + ".txt")
+
+	type fn func(*Crypt) func(string) string
+	fileFn := fn(func(d *Crypt) func(string) string { return d.shortenFileName })
+	dirFn := fn(func(d *Crypt) func(string) string { return d.shortenDirName })
 
 	tests := []struct {
 		name    string
 		mode    string
 		dirEnc  string
-		limit   int
+		shorten bool
+		fn      fn
 		enc     string
-		shorten func(d *Crypt) func(string) string
 		want    string
 	}{
-		{"file over limit", "standard", "false", 255, encLong, func(d *Crypt) func(string) string { return d.shortenFileName }, shortName(encLong)},
-		{"file under limit", "standard", "false", 255, "short-name", func(d *Crypt) func(string) string { return d.shortenFileName }, "short-name"},
-		{"limit disabled", "standard", "false", 0, encLong, func(d *Crypt) func(string) string { return d.shortenFileName }, encLong},
-		{"encryption off", "off", "false", 10, "plain.txt.bin", func(d *Crypt) func(string) string { return d.shortenFileName }, "plain.txt.bin"},
-		{"dir over limit", "standard", "true", 255, encLong, func(d *Crypt) func(string) string { return d.shortenDirName }, shortName(encLong)},
-		{"dir enc off", "standard", "false", 255, encLong, func(d *Crypt) func(string) string { return d.shortenDirName }, encLong},
-		{"dir enc on but mode off", "off", "true", 10, "plain", func(d *Crypt) func(string) string { return d.shortenDirName }, "plain"},
+		{"file switch on", "standard", "false", true, fileFn, encLong, shortName(encLong)},
+		{"file switch off", "standard", "false", false, fileFn, encLong, encLong},
+		{"file mode off", "off", "false", true, fileFn, "plain.txt.bin", "plain.txt.bin"},
+		{"dir switch on", "standard", "true", true, dirFn, encLong, shortName(encLong)},
+		{"dir switch off", "standard", "true", false, dirFn, encLong, encLong},
+		{"dir enc off", "standard", "false", true, dirFn, encLong, encLong},
+		{"dir mode off", "off", "true", true, dirFn, "plain", "plain"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := newTestCrypt(t, tt.mode, tt.dirEnc, tt.limit, newMemIO())
-			if got := tt.shorten(d)(tt.enc); got != tt.want {
+			d := newTestCrypt(t, tt.mode, tt.dirEnc, tt.shorten, newMemIO())
+			if got := tt.fn(d)(tt.enc); got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
@@ -136,31 +136,35 @@ func TestShortenName(t *testing.T) {
 }
 
 func TestShortenDirPathSegments(t *testing.T) {
-	shortSeg := testCipher(t, "standard", "true", "password").EncryptDirName("短")
-	longSeg := testCipher(t, "standard", "true", "password").EncryptDirName(strings.Repeat("目录", 80))
-	encPath := "/" + shortSeg + "/" + longSeg
+	c := testCipher(t, "standard", "true", "password")
+	seg1 := c.EncryptDirName("a")
+	seg2 := c.EncryptDirName("目录")
+	encPath := "/" + seg1 + "/" + seg2
 
-	d := newTestCrypt(t, "standard", "true", 255, newMemIO())
-	want := "/" + shortSeg + "/" + shortName(longSeg)
+	d := newTestCrypt(t, "standard", "true", true, newMemIO())
+	want := "/" + shortName(seg1) + "/" + shortName(seg2)
 	if got := d.shortenDirPathSegments(encPath); got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
-
-	d = newTestCrypt(t, "standard", "false", 255, newMemIO())
-	if got := d.shortenDirPathSegments(encPath); got != encPath {
-		t.Errorf("dir shortening inactive, path should be unchanged, got %q", got)
+	if got := d.shortenDirPathSegments("/"); got != "/" {
+		t.Errorf("root path = %q, want /", got)
 	}
 
-	d = newTestCrypt(t, "standard", "true", 0, newMemIO())
+	d = newTestCrypt(t, "standard", "true", false, newMemIO())
 	if got := d.shortenDirPathSegments(encPath); got != encPath {
-		t.Errorf("limit disabled, path should be unchanged, got %q", got)
+		t.Errorf("switch off, path should be unchanged, got %q", got)
+	}
+
+	d = newTestCrypt(t, "standard", "false", true, newMemIO())
+	if got := d.shortenDirPathSegments(encPath); got != encPath {
+		t.Errorf("dir shortening inactive, path should be unchanged, got %q", got)
 	}
 }
 
 func TestIndexRoundtrip(t *testing.T) {
 	ctx := context.Background()
 	m := newMemIO()
-	d := newTestCrypt(t, "standard", "true", 255, m)
+	d := newTestCrypt(t, "standard", "true", true, m)
 
 	if err := d.addIndexEntry(ctx, "/r", shortName("e1"), "e1"); err != nil {
 		t.Fatalf("addIndexEntry: %v", err)
@@ -174,7 +178,7 @@ func TestIndexRoundtrip(t *testing.T) {
 	}
 
 	// a cipher with a different password cannot read the index
-	other := newTestCrypt(t, "standard", "true", 255, m)
+	other := newTestCrypt(t, "standard", "true", true, m)
 	other.cipher = testCipher(t, "standard", "true", "other-password")
 	if _, err := other.loadIndex(ctx, "/r"); err == nil {
 		t.Errorf("loading the index with a wrong password should fail")
@@ -193,7 +197,7 @@ func TestIndexRoundtrip(t *testing.T) {
 func TestUpdateIndex(t *testing.T) {
 	ctx := context.Background()
 	m := newMemIO()
-	d := newTestCrypt(t, "standard", "true", 255, m)
+	d := newTestCrypt(t, "standard", "true", true, m)
 
 	key := shortName("e1")
 	// re-adding the same entry is idempotent
@@ -239,23 +243,25 @@ func TestUpdateIndex(t *testing.T) {
 func TestDecryptRemoteName(t *testing.T) {
 	ctx := context.Background()
 	m := newMemIO()
-	d := newTestCrypt(t, "standard", "true", 255, m)
+	d := newTestCrypt(t, "standard", "true", true, m)
 
+	// with the switch on every name is stored under its short name
 	long := strings.Repeat("超", 100) + ".txt"
-	enc := d.cipher.EncryptFileName(long)
-	sh := shortName(enc)
-	if err := d.addIndexEntry(ctx, "/r", sh, enc); err != nil {
+	longShort := shortName(d.cipher.EncryptFileName(long))
+	if err := d.addIndexEntry(ctx, "/r", longShort, d.cipher.EncryptFileName(long)); err != nil {
 		t.Fatalf("addIndexEntry: %v", err)
 	}
-
-	got, err := d.decryptRemoteName(ctx, "/r/"+sh, sh, false)
+	got, err := d.decryptRemoteName(ctx, "/r/"+longShort, longShort, false)
 	if err != nil || got != long {
 		t.Errorf("decryptRemoteName short = %q, %v; want %q", got, err, long)
 	}
 
-	// normal encrypted names still decrypt directly
-	short := d.cipher.EncryptFileName("ok.txt")
-	if got, err := d.decryptRemoteName(ctx, "/r/"+short, short, false); err != nil || got != "ok.txt" {
+	shortFile := d.cipher.EncryptFileName("ok.txt")
+	shortFileShort := shortName(shortFile)
+	if err := d.addIndexEntry(ctx, "/r", shortFileShort, shortFile); err != nil {
+		t.Fatalf("addIndexEntry: %v", err)
+	}
+	if got, err := d.decryptRemoteName(ctx, "/r/"+shortFileShort, shortFileShort, false); err != nil || got != "ok.txt" {
 		t.Errorf("decryptRemoteName plain = %q, %v", got, err)
 	}
 
@@ -265,42 +271,44 @@ func TestDecryptRemoteName(t *testing.T) {
 	}
 }
 
-func TestResolveListing(t *testing.T) {
+func TestResolveListingShortNames(t *testing.T) {
 	ctx := context.Background()
 	m := newMemIO()
-	d := newTestCrypt(t, "standard", "true", 255, m)
+	d := newTestCrypt(t, "standard", "true", true, m)
 
 	longFile := strings.Repeat("超", 100) + ".txt"
 	longFileEnc := d.cipher.EncryptFileName(longFile)
 	longFileShort := shortName(longFileEnc)
-	if len(longFileEnc) <= 255 {
-		t.Fatalf("longFileEnc too short: %d", len(longFileEnc))
-	}
+
+	normalEnc := d.cipher.EncryptFileName("short.txt")
+	normalShort := shortName(normalEnc)
+
+	dirEnc := d.cipher.EncryptDirName("dir")
+	dirShort := shortName(dirEnc)
 
 	longDir := strings.Repeat("目录", 80)
 	longDirEnc := d.cipher.EncryptDirName(longDir)
 	longDirShort := shortName(longDirEnc)
-	if len(longDirEnc) <= 255 {
-		t.Fatalf("longDirEnc too short: %d", len(longDirEnc))
-	}
 
-	// missing entry: an indexed name exists in the dir but not in the index
+	// an orphan short name exists on the remote but not in the index
 	orphanShort := shortName(d.cipher.EncryptFileName(strings.Repeat("缺", 100)))
 
-	if err := d.addIndexEntry(ctx, "/r", longFileShort, longFileEnc); err != nil {
-		t.Fatalf("addIndexEntry: %v", err)
-	}
-	if err := d.addIndexEntry(ctx, "/r", longDirShort, longDirEnc); err != nil {
-		t.Fatalf("addIndexEntry: %v", err)
+	for _, e := range []struct{ short, enc string }{
+		{longFileShort, longFileEnc},
+		{normalShort, normalEnc},
+		{dirShort, dirEnc},
+		{longDirShort, longDirEnc},
+	} {
+		if err := d.addIndexEntry(ctx, "/r", e.short, e.enc); err != nil {
+			t.Fatalf("addIndexEntry: %v", err)
+		}
 	}
 
-	normalEnc := d.cipher.EncryptFileName("short.txt")
-	normalDirEnc := d.cipher.EncryptDirName("dir")
 	objs := []model.Obj{
-		&model.Object{Name: normalEnc, Size: d.cipher.EncryptedSize(10)},
+		&model.Object{Name: normalShort, Size: d.cipher.EncryptedSize(10)},
 		&model.Object{Name: longFileShort, Size: d.cipher.EncryptedSize(20)},
+		&model.Object{Name: dirShort, IsFolder: true},
 		&model.Object{Name: longDirShort, IsFolder: true},
-		&model.Object{Name: normalDirEnc, IsFolder: true},
 		&model.Object{Name: orphanShort, Size: d.cipher.EncryptedSize(30)},
 		&model.Object{Name: "!!!not-encrypted!!!", Size: d.cipher.EncryptedSize(30)},
 		&model.Object{Name: indexFileName, Size: 42},
@@ -318,9 +326,8 @@ func TestResolveListing(t *testing.T) {
 	}
 	want := []entry{
 		{"short.txt", 10, false},
-		{"dir", 0, true},
-		// short names are resolved in a second pass and appended at the end
 		{longFile, 20, false},
+		{"dir", 0, true},
 		{longDir, 0, true},
 	}
 	if len(got) != len(want) {
@@ -335,12 +342,19 @@ func TestResolveListing(t *testing.T) {
 
 func TestResolveListingPlainDirs(t *testing.T) {
 	ctx := context.Background()
-	d := newTestCrypt(t, "standard", "false", 255, newMemIO())
+	m := newMemIO()
+	d := newTestCrypt(t, "standard", "false", true, m)
 
-	// with directory encryption off, dir names pass through unchanged
+	// with directory encryption off, dir names pass through unchanged while
+	// file names are still shortened
+	fileEnc := d.cipher.EncryptFileName("f.txt")
+	fileShort := shortName(fileEnc)
+	if err := d.addIndexEntry(ctx, "/r", fileShort, fileEnc); err != nil {
+		t.Fatalf("addIndexEntry: %v", err)
+	}
 	objs := []model.Obj{
 		&model.Object{Name: "plainDir", IsFolder: true},
-		&model.Object{Name: d.cipher.EncryptFileName("f.txt"), Size: d.cipher.EncryptedSize(1)},
+		&model.Object{Name: fileShort, Size: d.cipher.EncryptedSize(1)},
 	}
 	resolved := d.resolveListing(ctx, "/r", objs)
 	if len(resolved) != 2 {
@@ -348,6 +362,28 @@ func TestResolveListingPlainDirs(t *testing.T) {
 	}
 	if resolved[0].name != "plainDir" || !resolved[0].remote.IsDir() {
 		t.Errorf("plain dir not preserved: %+v", resolved[0])
+	}
+	if resolved[1].name != "f.txt" {
+		t.Errorf("file name not resolved: %+v", resolved[1])
+	}
+}
+
+func TestResolveListingKeepsFullNamesWhenOff(t *testing.T) {
+	ctx := context.Background()
+	d := newTestCrypt(t, "standard", "true", false, newMemIO())
+
+	// with the switch off, previously written full encrypted names must keep
+	// decrypting directly, without any index
+	objs := []model.Obj{
+		&model.Object{Name: d.cipher.EncryptDirName("dir"), IsFolder: true},
+		&model.Object{Name: d.cipher.EncryptFileName("f.txt"), Size: d.cipher.EncryptedSize(1)},
+	}
+	resolved := d.resolveListing(ctx, "/r", objs)
+	if len(resolved) != 2 {
+		t.Fatalf("resolved %d entries, want 2", len(resolved))
+	}
+	if resolved[0].name != "dir" || !resolved[0].remote.IsDir() {
+		t.Errorf("dir name not decrypted: %+v", resolved[0])
 	}
 	if resolved[1].name != "f.txt" {
 		t.Errorf("file name not decrypted: %+v", resolved[1])
