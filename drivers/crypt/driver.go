@@ -293,7 +293,7 @@ func (d *Crypt) MakeDir(ctx context.Context, parentDir model.Obj, dirName string
 	if finalName != encName {
 		// register before creating: a stale entry is harmless, while an
 		// unindexed short name would make the directory invisible
-		if err := d.addIndexEntry(ctx, remoteActualPath, finalName, encName); err != nil {
+		if err := d.addIndexEntry(ctx, parentDir.GetPath(), finalName, encName); err != nil {
 			return fmt.Errorf("failed to update name index: %w", err)
 		}
 	}
@@ -334,7 +334,7 @@ func (d *Crypt) Rename(ctx context.Context, srcObj model.Obj, newName string) er
 	if err != nil {
 		return err
 	}
-	dirPath := stdpath.Dir(remoteActualPath)
+	dirPath := stdpath.Dir(srcObj.GetPath())
 	oldName := stdpath.Base(remoteActualPath)
 	var encName, finalName string
 	if srcObj.IsDir() {
@@ -393,7 +393,7 @@ func (d *Crypt) Remove(ctx context.Context, obj model.Obj) error {
 	}
 	if d.fileShorteningActive() {
 		if name := stdpath.Base(remoteActualPath); isShortName(name) {
-			if err := d.removeIndexEntry(ctx, stdpath.Dir(remoteActualPath), name); err != nil {
+			if err := d.removeIndexEntry(ctx, stdpath.Dir(obj.GetPath()), name); err != nil {
 				log.Warnf("crypt: failed to remove index entry of %s: %v", name, err)
 			}
 		}
@@ -418,7 +418,7 @@ func (d *Crypt) Put(ctx context.Context, dstDir model.Obj, streamer model.FileSt
 	if finalName != encName {
 		// register before upload: a stale entry is harmless, while an
 		// unindexed short name would make the upload invisible
-		if err := d.addIndexEntry(ctx, remoteActualPath, finalName, encName); err != nil {
+		if err := d.addIndexEntry(ctx, dstDir.GetPath(), finalName, encName); err != nil {
 			return fmt.Errorf("failed to update name index: %w", err)
 		}
 	}

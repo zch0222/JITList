@@ -269,6 +269,12 @@ func TestDecryptRemoteName(t *testing.T) {
 	if _, err := d.decryptRemoteName(ctx, "/r/"+shortName("nobody"), shortName("nobody"), false); err == nil {
 		t.Errorf("unknown short name should fail")
 	}
+
+	// the index file has no encrypted name and keeps its plain one
+	got, err = d.decryptRemoteName(ctx, "/r/"+indexFileName, indexFileName, false)
+	if err != nil || got != indexFileName {
+		t.Errorf("decryptRemoteName(%s) = %q, %v; want the plain name", indexFileName, got, err)
+	}
 }
 
 func TestResolveListingShortNames(t *testing.T) {
@@ -311,7 +317,7 @@ func TestResolveListingShortNames(t *testing.T) {
 		&model.Object{Name: longDirShort, IsFolder: true},
 		&model.Object{Name: orphanShort, Size: d.cipher.EncryptedSize(30)},
 		&model.Object{Name: "!!!not-encrypted!!!", Size: d.cipher.EncryptedSize(30)},
-		&model.Object{Name: indexFileName, Size: 42},
+		&model.Object{Name: indexFileName, Size: d.cipher.EncryptedSize(64)},
 	}
 
 	resolved := d.resolveListing(ctx, "/r", objs)
@@ -325,6 +331,7 @@ func TestResolveListingShortNames(t *testing.T) {
 		got = append(got, entry{r.name, r.size, r.remote.IsDir()})
 	}
 	want := []entry{
+		{indexFileName, 64, false},
 		{"short.txt", 10, false},
 		{longFile, 20, false},
 		{"dir", 0, true},
@@ -337,6 +344,57 @@ func TestResolveListingShortNames(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("entry %d = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+func TestResolveListingWithoutIndex(t *testing.T) {
+	ctx := context.Background()
+	d := newTestCrypt(t, "standard", "true", true, newMemIO())
+
+	// with no index file on the remote the listing falls back to the default
+	// behavior: encrypted names decrypt, shortened names stay unresolvable
+	shortEnc := d.cipher.EncryptFileName("shortened.txt")
+	objs := []model.Obj{
+		&model.Object{Name: d.cipher.EncryptFileName("plain.txt"), Size: d.cipher.EncryptedSize(7)},
+		&model.Object{Name: d.cipher.EncryptDirName("sub"), IsFolder: true},
+		&model.Object{Name: shortName(shortEnc), Size: d.cipher.EncryptedSize(9)},
+	}
+	resolved := d.resolveListing(ctx, "/r", objs)
+	if len(resolved) != 2 {
+		t.Fatalf("resolved %d entries, want 2: %+v", len(resolved), resolved)
+	}
+	if resolved[0].name != "plain.txt" || resolved[0].size != 7 {
+		t.Errorf("plain file not resolved: %+v", resolved[0])
+	}
+	if resolved[1].name != "sub" || !resolved[1].remote.IsDir() {
+		t.Errorf("plain dir not resolved: %+v", resolved[1])
+	}
+}
+
+func TestResolveListingBrokenIndex(t *testing.T) {
+	ctx := context.Background()
+	m := newMemIO()
+	d := newTestCrypt(t, "standard", "true", true, m)
+
+	enc := d.cipher.EncryptFileName("shortened.txt")
+	short := shortName(enc)
+	if err := d.addIndexEntry(ctx, "/r", short, enc); err != nil {
+		t.Fatalf("addIndexEntry: %v", err)
+	}
+	indexPath := stdpath.Join("/r", indexFileName)
+	data := m.files[indexPath]
+	data[len(data)/2] ^= 0xFF
+	m.files[indexPath] = data
+
+	// an unreadable index only leaves the shortened entries unresolvable, the
+	// rest of the directory is unaffected
+	objs := []model.Obj{
+		&model.Object{Name: d.cipher.EncryptFileName("plain.txt"), Size: d.cipher.EncryptedSize(7)},
+		&model.Object{Name: short, Size: d.cipher.EncryptedSize(9)},
+	}
+	resolved := d.resolveListing(ctx, "/r", objs)
+	if len(resolved) != 1 || resolved[0].name != "plain.txt" {
+		t.Fatalf("resolved %+v, want only plain.txt", resolved)
 	}
 }
 

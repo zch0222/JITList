@@ -26,7 +26,8 @@ const nameEncOff = "off"
 // When name shortening is enabled, every encrypted name is stored under a
 // short name: "!" + 24 hex chars derived from the SHA-256 of the full
 // encrypted name. The mapping back to the encrypted name is kept in a
-// per-directory index file, so it survives OpenList reinstalls.
+// per-directory index file, so it survives OpenList reinstalls. The index
+// file has a plain name and is listed like any other entry.
 const (
 	indexFileName     = "opcrypt.idx"
 	shortNamePrefix   = "!"
@@ -53,7 +54,10 @@ type fileIO interface {
 	Remove(ctx context.Context, path string) error
 }
 
-// fsIO is the fileIO implementation backed by the mounted remote storage
+// fsIO is the fileIO implementation backed by the mounted remote storage.
+// Paths go through the fs layer, so callers must pass the same object paths
+// the driver uses for fs.List/fs.Move, with the mount path included, not the
+// paths the op layer returns once the mount path has been stripped
 type fsIO struct{}
 
 func (fsIO) ReadFile(ctx context.Context, path string) ([]byte, error) {
@@ -253,8 +257,14 @@ func (d *Crypt) shortenDirPathSegments(encPath string) string {
 }
 
 // decryptRemoteName decrypts a raw remote name, falling back to the
-// directory index for short names
+// directory index for short names. The index is only a secondary source: a
+// name it cannot resolve is reported as undecryptable, exactly as when the
+// shortening switch is off
 func (d *Crypt) decryptRemoteName(ctx context.Context, remoteFullPath, rawName string, isDir bool) (string, error) {
+	// the index file is stored unencrypted and is shown as a normal entry
+	if rawName == indexFileName {
+		return rawName, nil
+	}
 	if isDir {
 		if name, err := d.cipher.DecryptDirName(rawName); err == nil {
 			return name, nil
@@ -263,18 +273,17 @@ func (d *Crypt) decryptRemoteName(ctx context.Context, remoteFullPath, rawName s
 		return name, nil
 	}
 	if d.fileShorteningActive() && isShortName(rawName) {
-		m, err := d.loadIndex(ctx, stdpath.Dir(remoteFullPath))
+		dir := stdpath.Dir(remoteFullPath)
+		m, err := d.loadIndex(ctx, dir)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("failed to load name index of %s: %w", dir, err)
 		}
-		encName, ok := m[rawName]
-		if !ok {
-			return "", fmt.Errorf("short name %s not found in index", rawName)
+		if encName, ok := m[rawName]; ok {
+			if isDir {
+				return d.cipher.DecryptDirName(encName)
+			}
+			return d.cipher.DecryptFileName(encName)
 		}
-		if isDir {
-			return d.cipher.DecryptDirName(encName)
-		}
-		return d.cipher.DecryptFileName(encName)
 	}
 	return "", fmt.Errorf("failed to decrypt name %q", rawName)
 }
@@ -287,8 +296,10 @@ type listedObj struct {
 }
 
 // resolveListing maps raw remote objects to decrypted names, resolving
-// short names through the directory index and filtering undecryptable
-// entries (same as the previous behavior for files written by other tools)
+// short names through the directory index. Entries whose names cannot be
+// decrypted are dropped, and a short name without an index entry falls back
+// to that default path, so a missing or unreadable index never breaks a
+// listing: it only leaves the shortened entries unresolvable
 func (d *Crypt) resolveListing(ctx context.Context, remoteDirPath string, objs []model.Obj) []listedObj {
 	out := make([]listedObj, 0, len(objs))
 	type pendingShort struct {
@@ -298,12 +309,18 @@ func (d *Crypt) resolveListing(ctx context.Context, remoteDirPath string, objs [
 	var shorts []pendingShort
 	for _, obj := range objs {
 		rawName := model.UnwrapObjName(obj).GetName()
-		if rawName == indexFileName {
-			continue
-		}
 		mask := model.GetObjMask(obj)
 		if mask&model.Virtual != 0 {
 			out = append(out, listedObj{remote: obj, name: rawName, size: obj.GetSize()})
+			continue
+		}
+		// the index file is stored unencrypted and is shown as a normal entry
+		if rawName == indexFileName {
+			size := obj.GetSize()
+			if decryptedSize, err := d.cipher.DecryptedSize(size); err == nil {
+				size = decryptedSize
+			}
+			out = append(out, listedObj{remote: obj, name: rawName, size: size})
 			continue
 		}
 		if obj.IsDir() {
@@ -340,6 +357,8 @@ func (d *Crypt) resolveListing(ctx context.Context, remoteDirPath string, objs [
 			rawName := model.UnwrapObjName(p.remote).GetName()
 			encName, ok := m[rawName]
 			if !ok {
+				// no mapping for this short name: fall back to the default
+				// handling of an undecryptable name and leave the entry out
 				log.Debugf("crypt: short name %s has no index entry in %s", rawName, remoteDirPath)
 				continue
 			}
