@@ -152,6 +152,10 @@ func (a Addition) GetRootPath() string {
 }
 
 func (d *Crypt) Get(ctx context.Context, path string) (model.Obj, error) {
+	// the index file is stored under its plain name
+	if stdpath.Base(path) == indexFileName {
+		return d.getIndexFile(ctx, path)
+	}
 	firstTryIsFolder, secondTry := guessPath(path)
 	remoteFullPath := stdpath.Join(d.RemotePath, d.encryptPath(path, firstTryIsFolder))
 	remoteObj, err := fs.Get(ctx, remoteFullPath, &fs.GetArgs{NoLog: true})

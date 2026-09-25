@@ -3,6 +3,7 @@ package crypt
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	stdpath "path"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
@@ -93,6 +95,56 @@ func newCryptOnLocal(t *testing.T) (d *Crypt, remotePath, dataDir string) {
 	return d, remotePath, dataDir
 }
 
+// TestLegacyIndexOnRealStorage covers an index written under the plain name by
+// an earlier version: it stays readable and openable, and the next write
+// migrates it to the encrypted name
+func TestLegacyIndexOnRealStorage(t *testing.T) {
+	ctx := context.Background()
+	d, remotePath, dataDir := newCryptOnLocal(t)
+	parent := &model.Object{Path: remotePath, Name: "data", IsFolder: true}
+
+	dirEnc := d.cipher.EncryptDirName("k")
+	dirShort := shortName(dirEnc)
+	legacyPath := filepath.Join(dataDir, indexFileName)
+	if err := os.WriteFile(legacyPath, encryptedTestIndex(t, d, map[string]string{dirShort: dirEnc}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	requireIndexEntry(t, ctx, d, remotePath, dirShort, dirEnc)
+
+	objs, err := d.List(ctx, parent, model.ListArgs{})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	found := false
+	for _, obj := range objs {
+		if obj.GetName() == indexFileName {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the plain-named index is missing from the listing")
+	}
+
+	indexObj, err := d.Get(ctx, "/"+indexFileName)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", indexFileName, err)
+	}
+	if want := stdpath.Join(remotePath, indexFileName); indexObj.GetPath() != want {
+		t.Errorf("index obj path = %q, want %q", indexObj.GetPath(), want)
+	}
+
+	// the next write moves the index to the encrypted name
+	if err := d.MakeDir(ctx, parent, "k2"); err != nil {
+		t.Fatalf("MakeDir: %v", err)
+	}
+	if _, err := os.Stat(legacyPath); err == nil {
+		t.Errorf("the plain-named index should be gone after it was migrated")
+	}
+	requireOnDisk(t, filepath.Join(dataDir, d.indexFileNames()[0]))
+	requireIndexEntry(t, ctx, d, remotePath, dirShort, dirEnc)
+}
+
 func deleteStorage(t *testing.T, id uint) {
 	t.Helper()
 	if err := op.DeleteStorageById(context.Background(), id); err != nil {
@@ -136,6 +188,12 @@ func TestIndexOnRealStorage(t *testing.T) {
 	requireOnDisk(t, filepath.Join(dataDir, dirShort))
 	requireIndexEntry(t, ctx, d, remotePath, dirShort, dirEnc)
 
+	// on the remote the index lives under its encrypted name
+	requireOnDisk(t, filepath.Join(dataDir, d.indexFileNames()[0]))
+	if _, err := os.Stat(filepath.Join(dataDir, indexFileName)); err == nil {
+		t.Errorf("the index is also present under its plain name")
+	}
+
 	// uploading a file does the same for its name
 	const contents = "hello"
 	fileStream := &stream.FileStream{
@@ -167,6 +225,43 @@ func TestIndexOnRealStorage(t *testing.T) {
 	}
 	if _, ok := names[indexFileName]; !ok {
 		t.Errorf("listing %v is missing the index file", names)
+	}
+
+	// the index file opens and downloads like any other entry; the download
+	// is the decrypted mapping
+	indexObj, err := d.Get(ctx, "/"+indexFileName)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", indexFileName, err)
+	}
+	if indexObj.GetName() != indexFileName {
+		t.Errorf("index obj name = %q, want %q", indexObj.GetName(), indexFileName)
+	}
+	if indexObj.IsDir() {
+		t.Errorf("index obj is reported as a directory")
+	}
+	link, err := d.Link(ctx, indexObj, model.LinkArgs{})
+	if err != nil {
+		t.Fatalf("Link(%s): %v", indexFileName, err)
+	}
+	defer link.Close()
+	rc, err := link.RangeReader.RangeRead(ctx, http_range.Range{Start: 0, Length: -1})
+	if err != nil {
+		t.Fatalf("RangeRead(%s): %v", indexFileName, err)
+	}
+	defer rc.Close()
+	downloaded, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read %s: %v", indexFileName, err)
+	}
+	if int64(len(downloaded)) != indexObj.GetSize() {
+		t.Errorf("downloaded %d bytes, the object reports %d", len(downloaded), indexObj.GetSize())
+	}
+	var downloadedIndex indexFile
+	if err := json.Unmarshal(downloaded, &downloadedIndex); err != nil {
+		t.Fatalf("the downloaded index is not valid JSON: %v", err)
+	}
+	if downloadedIndex.Names[fileShort] != fileEnc {
+		t.Errorf("the downloaded index misses the uploaded file: %v", downloadedIndex.Names)
 	}
 
 	// renaming moves the entry over to the new short name

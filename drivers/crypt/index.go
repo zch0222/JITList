@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
@@ -26,8 +27,10 @@ const nameEncOff = "off"
 // When name shortening is enabled, every encrypted name is stored under a
 // short name: "!" + 24 hex chars derived from the SHA-256 of the full
 // encrypted name. The mapping back to the encrypted name is kept in a
-// per-directory index file, so it survives OpenList reinstalls. The index
-// file has a plain name and is listed like any other entry.
+// per-directory index file, so it survives OpenList reinstalls. On the remote
+// the index is stored under the encrypted form of indexFileName and is listed
+// like any other entry; an index written under the plain name by an earlier
+// version is still read and replaced on the next write.
 const (
 	indexFileName     = "opcrypt.idx"
 	shortNamePrefix   = "!"
@@ -120,14 +123,14 @@ type indexFile struct {
 	Names   map[string]string `json:"names"`
 }
 
-func (d *Crypt) loadIndex(ctx context.Context, remoteDir string) (map[string]string, error) {
-	data, err := d.fileIO.ReadFile(ctx, stdpath.Join(remoteDir, indexFileName))
-	if err != nil {
-		if errs.IsObjectNotFound(err) {
-			return map[string]string{}, nil
-		}
-		return nil, err
-	}
+// indexFileNames returns the names the index file may be stored under, in the
+// order they are looked up: the encrypted one, then the plain name that
+// earlier versions wrote
+func (d *Crypt) indexFileNames() []string {
+	return []string{d.cipher.EncryptFileName(indexFileName), indexFileName}
+}
+
+func (d *Crypt) parseIndex(data []byte) (map[string]string, error) {
 	dec, err := d.cipher.DecryptData(io.NopCloser(bytes.NewReader(data)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt name index: %w", err)
@@ -150,10 +153,38 @@ func (d *Crypt) loadIndex(ctx context.Context, remoteDir string) (map[string]str
 	return idx.Names, nil
 }
 
-func (d *Crypt) saveIndex(ctx context.Context, remoteDir string, m map[string]string) error {
-	indexPath := stdpath.Join(remoteDir, indexFileName)
+func (d *Crypt) loadIndex(ctx context.Context, remoteDir string) (map[string]string, error) {
+	m, _, err := d.loadIndexNamed(ctx, remoteDir)
+	return m, err
+}
+
+// loadIndexNamed reads the index of remoteDir and reports the name it was
+// stored under, so a caller writing it back can replace a legacy file
+func (d *Crypt) loadIndexNamed(ctx context.Context, remoteDir string) (map[string]string, string, error) {
+	for _, name := range d.indexFileNames() {
+		data, err := d.fileIO.ReadFile(ctx, stdpath.Join(remoteDir, name))
+		if err != nil {
+			if errs.IsObjectNotFound(err) {
+				continue
+			}
+			return nil, "", err
+		}
+		m, err := d.parseIndex(data)
+		return m, name, err
+	}
+	return map[string]string{}, "", nil
+}
+
+// saveIndex writes the index under its encrypted name. storedName is the name
+// the index was read from, so a plain-named file left behind by an earlier
+// version is dropped once its content has been migrated
+func (d *Crypt) saveIndex(ctx context.Context, remoteDir string, m map[string]string, storedName string) error {
 	if len(m) == 0 {
-		if err := d.fileIO.Remove(ctx, indexPath); err != nil && !errs.IsObjectNotFound(err) {
+		// nothing was read means nothing was written under either name
+		if storedName == "" {
+			return nil
+		}
+		if err := d.fileIO.Remove(ctx, stdpath.Join(remoteDir, storedName)); err != nil && !errs.IsObjectNotFound(err) {
 			return err
 		}
 		return nil
@@ -170,7 +201,16 @@ func (d *Crypt) saveIndex(ctx context.Context, remoteDir string, m map[string]st
 	if err != nil {
 		return err
 	}
-	return d.fileIO.WriteFile(ctx, remoteDir, indexFileName, data)
+	name := d.indexFileNames()[0]
+	if err := d.fileIO.WriteFile(ctx, remoteDir, name, data); err != nil {
+		return err
+	}
+	if storedName != "" && storedName != name {
+		if err := d.fileIO.Remove(ctx, stdpath.Join(remoteDir, storedName)); err != nil && !errs.IsObjectNotFound(err) {
+			log.Warnf("crypt: failed to remove the migrated name index %s: %v", storedName, err)
+		}
+	}
+	return nil
 }
 
 // updateIndex re-reads the index and applies mutate before writing it back,
@@ -178,14 +218,14 @@ func (d *Crypt) saveIndex(ctx context.Context, remoteDir string, m map[string]st
 func (d *Crypt) updateIndex(ctx context.Context, remoteDir string, mutate func(m map[string]string) error) error {
 	d.idxMu.Lock()
 	defer d.idxMu.Unlock()
-	m, err := d.loadIndex(ctx, remoteDir)
+	m, storedName, err := d.loadIndexNamed(ctx, remoteDir)
 	if err != nil {
 		return err
 	}
 	if err := mutate(m); err != nil {
 		return err
 	}
-	return d.saveIndex(ctx, remoteDir, m)
+	return d.saveIndex(ctx, remoteDir, m, storedName)
 }
 
 func (d *Crypt) addIndexEntry(ctx context.Context, remoteDir, shortKey, encName string) error {
@@ -211,6 +251,47 @@ func (d *Crypt) lookupIndexEntry(ctx context.Context, remoteDir, shortKey string
 		return "", err
 	}
 	return m[shortKey], nil
+}
+
+// indexRemotePath maps the virtual path of an index file to the remote path it
+// is stored under: the directory part is encrypted like any other, the file
+// name is used as given
+func (d *Crypt) indexRemotePath(path, name string) string {
+	dir, _ := stdpath.Split(path)
+	return stdpath.Join(d.RemotePath, d.shortenDirPathSegments(d.cipher.EncryptDirName(dir)), name)
+}
+
+// getIndexFile resolves an index file, which is stored next to the entries it
+// maps, under its encrypted name or, for files written by earlier versions,
+// under its plain name
+func (d *Crypt) getIndexFile(ctx context.Context, path string) (model.Obj, error) {
+	var firstErr error
+	for _, name := range d.indexFileNames() {
+		remoteFullPath := d.indexRemotePath(path, name)
+		remoteObj, err := fs.Get(ctx, remoteFullPath, &fs.GetArgs{NoLog: true})
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		size := remoteObj.GetSize()
+		if !remoteObj.IsDir() {
+			if decryptedSize, err := d.cipher.DecryptedSize(size); err == nil {
+				size = decryptedSize
+			}
+		}
+		return &model.Object{
+			Path:     remoteFullPath,
+			Name:     indexFileName,
+			Size:     size,
+			Modified: remoteObj.ModTime(),
+			IsFolder: remoteObj.IsDir(),
+			Ctime:    remoteObj.CreateTime(),
+			Mask:     model.GetObjMask(remoteObj) &^ model.Temp,
+		}, nil
+	}
+	return nil, firstErr
 }
 
 // shortening only applies to names that are actually encrypted: with
@@ -261,7 +342,8 @@ func (d *Crypt) shortenDirPathSegments(encPath string) string {
 // name it cannot resolve is reported as undecryptable, exactly as when the
 // shortening switch is off
 func (d *Crypt) decryptRemoteName(ctx context.Context, remoteFullPath, rawName string, isDir bool) (string, error) {
-	// the index file is stored unencrypted and is shown as a normal entry
+	// an index written under the plain name by an earlier version has no
+	// encrypted name to decrypt, so it is shown as it is
 	if rawName == indexFileName {
 		return rawName, nil
 	}
@@ -314,7 +396,8 @@ func (d *Crypt) resolveListing(ctx context.Context, remoteDirPath string, objs [
 			out = append(out, listedObj{remote: obj, name: rawName, size: obj.GetSize()})
 			continue
 		}
-		// the index file is stored unencrypted and is shown as a normal entry
+		// an index written under the plain name by an earlier version has no
+		// encrypted name to decrypt, so it is shown as it is
 		if rawName == indexFileName {
 			size := obj.GetSize()
 			if decryptedSize, err := d.cipher.DecryptedSize(size); err == nil {

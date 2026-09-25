@@ -1,7 +1,10 @@
 package crypt
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	stdpath "path"
 	"strings"
 	"testing"
@@ -177,18 +180,19 @@ func TestIndexRoundtrip(t *testing.T) {
 		t.Errorf("index roundtrip mismatch: %v", got)
 	}
 
-	// a cipher with a different password cannot read the index
-	other := newTestCrypt(t, "standard", "true", true, m)
-	other.cipher = testCipher(t, "standard", "true", "other-password")
-	if _, err := other.loadIndex(ctx, "/r"); err == nil {
-		t.Errorf("loading the index with a wrong password should fail")
+	// the index is stored under the encrypted name, not the plain one
+	encIndexPath := stdpath.Join("/r", d.indexFileNames()[0])
+	if _, ok := m.files[encIndexPath]; !ok {
+		t.Errorf("the index was not written under its encrypted name")
+	}
+	if _, ok := m.files[stdpath.Join("/r", indexFileName)]; ok {
+		t.Errorf("the index was written under the plain name")
 	}
 
 	// corrupted index content must not parse
-	indexPath := stdpath.Join("/r", indexFileName)
-	data := m.files[indexPath]
+	data := m.files[encIndexPath]
 	data[len(data)/2] ^= 0xFF
-	m.files[indexPath] = data
+	m.files[encIndexPath] = data
 	if _, err := d.loadIndex(ctx, "/r"); err == nil {
 		t.Errorf("loading a corrupted index should fail")
 	}
@@ -230,13 +234,124 @@ func TestUpdateIndex(t *testing.T) {
 	if err := d.removeIndexEntry(ctx, "/r", shortName("e2")); err != nil {
 		t.Fatalf("removeIndexEntry: %v", err)
 	}
-	if _, ok := m.files[stdpath.Join("/r", indexFileName)]; ok {
+	if _, ok := m.files[stdpath.Join("/r", d.indexFileNames()[0])]; ok {
 		t.Errorf("empty index should be deleted from the remote")
 	}
 
 	// removing from a missing index is tolerated
 	if err := d.removeIndexEntry(ctx, "/missing", shortName("e1")); err != nil {
 		t.Errorf("removeIndexEntry on missing index: %v", err)
+	}
+}
+
+// encryptedTestIndex builds the remote content of an index file
+func encryptedTestIndex(t *testing.T, d *Crypt, names map[string]string) []byte {
+	t.Helper()
+	plain, err := json.Marshal(indexFile{Version: indexVersion, Names: names})
+	if err != nil {
+		t.Fatalf("marshal index: %v", err)
+	}
+	encReader, err := d.cipher.EncryptData(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("encrypt index: %v", err)
+	}
+	data, err := io.ReadAll(encReader)
+	if err != nil {
+		t.Fatalf("read encrypted index: %v", err)
+	}
+	return data
+}
+
+func TestIndexNamePreference(t *testing.T) {
+	ctx := context.Background()
+	m := newMemIO()
+	d := newTestCrypt(t, "standard", "true", true, m)
+	encIndexPath := stdpath.Join("/r", d.cipher.EncryptFileName(indexFileName))
+	plainIndexPath := stdpath.Join("/r", indexFileName)
+
+	// an index written under the plain name by an earlier version is read
+	m.files[plainIndexPath] = encryptedTestIndex(t, d, map[string]string{"!a": "legacy"})
+	got, err := d.loadIndex(ctx, "/r")
+	if err != nil {
+		t.Fatalf("loadIndex: %v", err)
+	}
+	if got["!a"] != "legacy" {
+		t.Errorf("the plain-named index was not read: %v", got)
+	}
+
+	// the encrypted name wins when both are present
+	m.files[encIndexPath] = encryptedTestIndex(t, d, map[string]string{"!a": "current"})
+	got, err = d.loadIndex(ctx, "/r")
+	if err != nil {
+		t.Fatalf("loadIndex: %v", err)
+	}
+	if got["!a"] != "current" {
+		t.Errorf("the encrypted index should win over the plain one: %v", got)
+	}
+}
+
+func TestIndexLegacyMigration(t *testing.T) {
+	ctx := context.Background()
+	m := newMemIO()
+	d := newTestCrypt(t, "standard", "true", true, m)
+	plainIndexPath := stdpath.Join("/r", indexFileName)
+	m.files[plainIndexPath] = encryptedTestIndex(t, d, map[string]string{"!old": "old"})
+
+	// writing replaces the plain-named file with the encrypted one
+	if err := d.addIndexEntry(ctx, "/r", "!new", "new"); err != nil {
+		t.Fatalf("addIndexEntry: %v", err)
+	}
+	if _, ok := m.files[plainIndexPath]; ok {
+		t.Errorf("the plain-named index should be dropped after it was migrated")
+	}
+	got, err := d.loadIndex(ctx, "/r")
+	if err != nil {
+		t.Fatalf("loadIndex: %v", err)
+	}
+	if len(got) != 2 || got["!old"] != "old" || got["!new"] != "new" {
+		t.Errorf("migrated index mismatch: %v", got)
+	}
+}
+
+func TestIndexLegacyRemoval(t *testing.T) {
+	ctx := context.Background()
+	m := newMemIO()
+	d := newTestCrypt(t, "standard", "true", true, m)
+	plainIndexPath := stdpath.Join("/r", indexFileName)
+	m.files[plainIndexPath] = encryptedTestIndex(t, d, map[string]string{"!old": "old"})
+
+	// removing the last entry deletes the file that was read, and nothing is
+	// written under the encrypted name
+	if err := d.removeIndexEntry(ctx, "/r", "!old"); err != nil {
+		t.Fatalf("removeIndexEntry: %v", err)
+	}
+	if _, ok := m.files[plainIndexPath]; ok {
+		t.Errorf("the plain-named index should be deleted once it is empty")
+	}
+	if _, ok := m.files[stdpath.Join("/r", d.indexFileNames()[0])]; ok {
+		t.Errorf("nothing should be written under the encrypted name")
+	}
+}
+
+func TestIndexWriteWithForeignPassword(t *testing.T) {
+	ctx := context.Background()
+	m := newMemIO()
+	d := newTestCrypt(t, "standard", "true", true, m)
+	m.files[stdpath.Join("/r", indexFileName)] = encryptedTestIndex(t, d, map[string]string{"!a": "legacy"})
+
+	// another password derives another encrypted name and cannot decrypt the
+	// plain-named index either, so it must not clobber it
+	other := newTestCrypt(t, "standard", "true", true, m)
+	other.cipher = testCipher(t, "standard", "true", "other-password")
+	if err := other.addIndexEntry(ctx, "/r", "!b", "b"); err == nil {
+		t.Errorf("writing to a foreign index should fail instead of clobbering it")
+	}
+	got, err := d.loadIndex(ctx, "/r")
+	if err != nil {
+		t.Fatalf("loadIndex: %v", err)
+	}
+	if len(got) != 1 || got["!a"] != "legacy" {
+		t.Errorf("the foreign write changed the index: %v", got)
 	}
 }
 
@@ -347,6 +462,39 @@ func TestResolveListingShortNames(t *testing.T) {
 	}
 }
 
+func TestIndexRemotePath(t *testing.T) {
+	d := newTestCrypt(t, "standard", "true", true, newMemIO())
+	d.RemotePath = "/remote"
+	encName, plainName := d.indexFileNames()[0], d.indexFileNames()[1]
+	if encName != d.cipher.EncryptFileName(indexFileName) || plainName != indexFileName {
+		t.Fatalf("index names = %q, %q; want the encrypted name first, then the plain one", encName, plainName)
+	}
+
+	// the encrypted name is used in the remote root
+	if got, want := d.indexRemotePath("/"+indexFileName, encName), "/remote/"+encName; got != want {
+		t.Errorf("root index path = %q, want %q", got, want)
+	}
+
+	// the plain name is still addressable for files of earlier versions
+	if got, want := d.indexRemotePath("/"+indexFileName, plainName), "/remote/"+plainName; got != want {
+		t.Errorf("legacy index path = %q, want %q", got, want)
+	}
+
+	// in a subdirectory the directory segments are encrypted and shortened
+	subEnc := d.cipher.EncryptDirName("sub")
+	want := "/remote/" + shortName(subEnc) + "/" + encName
+	if got := d.indexRemotePath("/sub/"+indexFileName, encName); got != want {
+		t.Errorf("nested index path = %q, want %q", got, want)
+	}
+
+	// with directory encryption off the segments stay plain
+	plain := newTestCrypt(t, "standard", "false", true, newMemIO())
+	plain.RemotePath = "/remote"
+	if got, want := plain.indexRemotePath("/sub/"+indexFileName, plainName), "/remote/sub/"+plainName; got != want {
+		t.Errorf("plain dir index path = %q, want %q", got, want)
+	}
+}
+
 func TestResolveListingWithoutIndex(t *testing.T) {
 	ctx := context.Background()
 	d := newTestCrypt(t, "standard", "true", true, newMemIO())
@@ -381,7 +529,7 @@ func TestResolveListingBrokenIndex(t *testing.T) {
 	if err := d.addIndexEntry(ctx, "/r", short, enc); err != nil {
 		t.Fatalf("addIndexEntry: %v", err)
 	}
-	indexPath := stdpath.Join("/r", indexFileName)
+	indexPath := stdpath.Join("/r", d.indexFileNames()[0])
 	data := m.files[indexPath]
 	data[len(data)/2] ^= 0xFF
 	m.files[indexPath] = data
