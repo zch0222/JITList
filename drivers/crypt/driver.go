@@ -353,6 +353,14 @@ func (d *Crypt) Rename(ctx context.Context, srcObj model.Obj, newName string) er
 		encName = d.cipher.EncryptFileName(newName)
 		finalName = d.shortenFileName(encName)
 	}
+	// as in Put, an entry written while the switch was off keeps its full
+	// name, so the remote handles renaming onto it as it would without
+	// shortening instead of keeping it next to a short name
+	if finalName != encName && newName != indexFileName {
+		if _, err := fs.Get(ctx, stdpath.Join(dirPath, encName), &fs.GetArgs{NoLog: true}); err == nil {
+			finalName = encName
+		}
+	}
 	if finalName != encName {
 		// register the new short name before the rename; the old entry is
 		// kept until the rename succeeds so a failure stays reversible
@@ -424,6 +432,14 @@ func (d *Crypt) Put(ctx context.Context, dstDir model.Obj, streamer model.FileSt
 
 	encName := d.cipher.EncryptFileName(streamer.GetName())
 	finalName := d.shortenFileName(encName)
+	// a file written while the switch was off keeps its full name, so the
+	// remote overwrites it instead of storing a second copy under the short
+	// name. The index is stored under the encrypted form of its own name,
+	// which an upload named like it must never take over
+	if exist := streamer.GetExist(); finalName != encName && exist != nil && !exist.IsDir() &&
+		streamer.GetName() != indexFileName && stdpath.Base(exist.GetPath()) == encName {
+		finalName = encName
+	}
 	if finalName != encName {
 		// register before upload: a stale entry is harmless, while an
 		// unindexed short name would make the upload invisible
@@ -432,7 +448,10 @@ func (d *Crypt) Put(ctx context.Context, dstDir model.Obj, streamer model.FileSt
 		}
 	}
 
-	// doesn't support seekableStream, since rapid-upload is not working for encrypted data
+	// doesn't support seekableStream, since rapid-upload is not working for encrypted data.
+	// Exist is left for op.Put to fill in with the object of the remote: the
+	// one of this storage would mislead drivers that act on it, such as
+	// overwriting by ID
 	streamOut := &stream.FileStream{
 		Obj: &model.Object{
 			ID:       streamer.GetID(),
@@ -445,7 +464,6 @@ func (d *Crypt) Put(ctx context.Context, dstDir model.Obj, streamer model.FileSt
 		Reader:            wrappedIn,
 		Mimetype:          "application/octet-stream",
 		ForceStreamUpload: true,
-		Exist:             streamer.GetExist(),
 	}
 	return op.Put(ctx, remoteStorage, remoteActualPath, streamOut, up)
 }

@@ -161,6 +161,43 @@ func requireOnDisk(t *testing.T, path string) {
 	}
 }
 
+func requireNotOnDisk(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err == nil {
+		t.Errorf("%s should not exist on the underlying storage", path)
+	}
+}
+
+// requireContents opens the file at the virtual path through the fs/op stack
+// and checks its name, reported size and downloaded contents
+func requireContents(t *testing.T, ctx context.Context, d *Crypt, path, want string) {
+	t.Helper()
+	obj, err := fs.Get(ctx, d.GetStorage().MountPath+path, &fs.GetArgs{NoLog: true})
+	if err != nil {
+		t.Fatalf("Get(%s): %v", path, err)
+	}
+	if obj.GetName() != stdpath.Base(path) || obj.GetSize() != int64(len(want)) {
+		t.Errorf("%s resolved as %q with %d bytes, want %d bytes", path, obj.GetName(), obj.GetSize(), len(want))
+	}
+	link, err := d.Link(ctx, obj, model.LinkArgs{})
+	if err != nil {
+		t.Fatalf("Link(%s): %v", path, err)
+	}
+	defer link.Close()
+	rc, err := link.RangeReader.RangeRead(ctx, http_range.Range{Start: 0, Length: -1})
+	if err != nil {
+		t.Fatalf("RangeRead(%s): %v", path, err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if string(got) != want {
+		t.Errorf("%s holds %q, want %q", path, got, want)
+	}
+}
+
 func requireIndexEntry(t *testing.T, ctx context.Context, d *Crypt, dir, short, enc string) map[string]string {
 	t.Helper()
 	idx, err := d.loadIndex(ctx, dir)
@@ -341,30 +378,7 @@ func TestFullNamesOnRealStorage(t *testing.T) {
 	}
 
 	// the old file opens and downloads
-	fileObj, err := fs.Get(ctx, mount+"/old/old.txt", &fs.GetArgs{NoLog: true})
-	if err != nil {
-		t.Fatalf("Get(old.txt): %v", err)
-	}
-	if fileObj.GetName() != "old.txt" || fileObj.GetSize() != int64(len(contents)) {
-		t.Errorf("old.txt resolved as %q with %d bytes", fileObj.GetName(), fileObj.GetSize())
-	}
-	link, err := d.Link(ctx, fileObj, model.LinkArgs{})
-	if err != nil {
-		t.Fatalf("Link(old.txt): %v", err)
-	}
-	defer link.Close()
-	rc, err := link.RangeReader.RangeRead(ctx, http_range.Range{Start: 0, Length: -1})
-	if err != nil {
-		t.Fatalf("RangeRead(old.txt): %v", err)
-	}
-	defer rc.Close()
-	downloaded, err := io.ReadAll(rc)
-	if err != nil {
-		t.Fatalf("read old.txt: %v", err)
-	}
-	if string(downloaded) != contents {
-		t.Errorf("downloaded %q, want %q", downloaded, contents)
-	}
+	requireContents(t, ctx, d, "/old/old.txt", contents)
 
 	// so do the index files of the old directories
 	for _, p := range []string{"/old/" + indexFileName, "/new/moved/" + indexFileName} {
@@ -385,7 +399,67 @@ func TestFullNamesOnRealStorage(t *testing.T) {
 	if err := fs.MakeDir(ctx, mount+"/old"); err != nil {
 		t.Fatalf("MakeDir(old): %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dataDir, shortName(oldEnc))); err == nil {
-		t.Errorf("MakeDir created a shortened twin of an existing directory")
+	requireNotOnDisk(t, filepath.Join(dataDir, shortName(oldEnc)))
+}
+
+// TestOverwriteFullNamesOnRealStorage replaces files written while the switch
+// was off. They keep their full names and are overwritten in place, instead of
+// getting a second copy under the short name that the listing would hide
+func TestOverwriteFullNamesOnRealStorage(t *testing.T) {
+	ctx := context.Background()
+	d, remotePath, dataDir := newCryptOnLocal(t)
+	mount := d.GetStorage().MountPath
+	writeFullName := func(name, contents string) string {
+		t.Helper()
+		enc := d.cipher.EncryptFileName(name)
+		if err := os.WriteFile(filepath.Join(dataDir, enc), encryptedTestData(t, d, []byte(contents)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return enc
 	}
+	// uploads take the path of /api/fs/put, which looks the target up first
+	put := func(name, contents string) {
+		t.Helper()
+		fileStream := &stream.FileStream{
+			Obj:    &model.Object{Name: name, Size: int64(len(contents)), Modified: time.Now()},
+			Reader: strings.NewReader(contents),
+		}
+		if err := fs.PutDirectly(ctx, mount, fileStream); err != nil {
+			t.Fatalf("Put(%s): %v", name, err)
+		}
+	}
+
+	// uploading over an old file overwrites it under its full name
+	aEnc := writeFullName("a.txt", "old")
+	put("a.txt", "uploaded")
+	requireContents(t, ctx, d, "/a.txt", "uploaded")
+	requireNotOnDisk(t, filepath.Join(dataDir, shortName(aEnc)))
+
+	// so does renaming onto it
+	bEnc := writeFullName("b.txt", "renamed")
+	if err := fs.Rename(ctx, mount+"/b.txt", "a.txt"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	requireContents(t, ctx, d, "/a.txt", "renamed")
+	requireNotOnDisk(t, filepath.Join(dataDir, shortName(aEnc)))
+	requireNotOnDisk(t, filepath.Join(dataDir, bEnc))
+	idx, err := d.loadIndex(ctx, remotePath)
+	if err != nil {
+		t.Fatalf("loadIndex: %v", err)
+	}
+	if len(idx) != 0 {
+		t.Errorf("names kept in full should not be indexed: %v", idx)
+	}
+
+	// a file stored under its short name is still overwritten under it
+	cEnc := d.cipher.EncryptFileName("c.txt")
+	put("c.txt", "first")
+	put("c.txt", "second")
+	requireContents(t, ctx, d, "/c.txt", "second")
+	requireNotOnDisk(t, filepath.Join(dataDir, cEnc))
+	requireIndexEntry(t, ctx, d, remotePath, shortName(cEnc), cEnc)
+
+	// an upload named like the index never takes its place
+	put(indexFileName, "not an index")
+	requireIndexEntry(t, ctx, d, remotePath, shortName(cEnc), cEnc)
 }
