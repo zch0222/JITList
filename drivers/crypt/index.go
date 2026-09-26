@@ -10,6 +10,7 @@ import (
 	"io"
 	stdpath "path"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -253,12 +254,22 @@ func (d *Crypt) lookupIndexEntry(ctx context.Context, remoteDir, shortKey string
 	return m[shortKey], nil
 }
 
-// indexRemotePath maps the virtual path of an index file to the remote path it
-// is stored under: the directory part is encrypted like any other, the file
-// name is used as given
-func (d *Crypt) indexRemotePath(path, name string) string {
+// indexRemotePaths lists the remote paths the index file at the virtual path
+// may be stored under, in lookup order. Its directory is encrypted like any
+// other, under shortened names before the full encrypted names of directories
+// written while the switch was off, and in each the encrypted file name comes
+// before the plain one
+func (d *Crypt) indexRemotePaths(path string) []string {
 	dir, _ := stdpath.Split(path)
-	return stdpath.Join(d.RemotePath, d.shortenDirPathSegments(d.cipher.EncryptDirName(dir)), name)
+	var paths []string
+	for _, encDir := range []string{d.encryptPath(dir, true), d.encryptFullPath(dir, true)} {
+		for _, name := range d.indexFileNames() {
+			if p := stdpath.Join(d.RemotePath, encDir, name); !slices.Contains(paths, p) {
+				paths = append(paths, p)
+			}
+		}
+	}
+	return paths
 }
 
 // getIndexFile resolves an index file, which is stored next to the entries it
@@ -266,8 +277,7 @@ func (d *Crypt) indexRemotePath(path, name string) string {
 // under its plain name
 func (d *Crypt) getIndexFile(ctx context.Context, path string) (model.Obj, error) {
 	var firstErr error
-	for _, name := range d.indexFileNames() {
-		remoteFullPath := d.indexRemotePath(path, name)
+	for _, remoteFullPath := range d.indexRemotePaths(path) {
 		remoteObj, err := fs.Get(ctx, remoteFullPath, &fs.GetArgs{NoLog: true})
 		if err != nil {
 			if firstErr == nil {
@@ -290,6 +300,11 @@ func (d *Crypt) getIndexFile(ctx context.Context, path string) (model.Obj, error
 			Ctime:    remoteObj.CreateTime(),
 			Mask:     model.GetObjMask(remoteObj) &^ model.Temp,
 		}, nil
+	}
+	if errs.IsObjectNotFound(firstErr) && d.dirShorteningActive() {
+		// as in Get, a directory path mixing short and full names is only
+		// resolved by the listing of its parent
+		return nil, errs.NotSupport
 	}
 	return nil, firstErr
 }

@@ -14,6 +14,8 @@ import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/local"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
@@ -288,5 +290,102 @@ func TestIndexOnRealStorage(t *testing.T) {
 	}
 	if _, stale := idx[fileShort]; stale {
 		t.Errorf("the index kept the removed file's entry: %v", idx)
+	}
+}
+
+// TestFullNamesOnRealStorage covers entries written while the switch was off.
+// They keep their full encrypted names, alone or mixed with short names on one
+// path, and must stay reachable by path through the fs/op stack
+func TestFullNamesOnRealStorage(t *testing.T) {
+	ctx := context.Background()
+	d, remotePath, dataDir := newCryptOnLocal(t)
+	mount := d.GetStorage().MountPath
+	parent := &model.Object{Path: remotePath, Name: "data", IsFolder: true}
+
+	// a directory holding a file, both written while the switch was off
+	oldEnc := d.cipher.EncryptDirName("old")
+	if err := os.Mkdir(filepath.Join(dataDir, oldEnc), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const contents = "written while the switch was off"
+	oldFilePath := filepath.Join(dataDir, oldEnc, d.cipher.EncryptFileName("old.txt"))
+	if err := os.WriteFile(oldFilePath, encryptedTestData(t, d, []byte(contents)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// a directory created in it with the switch on, which gives it an index
+	oldDir := &model.Object{Path: stdpath.Join(remotePath, oldEnc), Name: oldEnc, IsFolder: true}
+	if err := d.MakeDir(ctx, oldDir, "fresh"); err != nil {
+		t.Fatalf("MakeDir(fresh): %v", err)
+	}
+
+	// the other way round: an old directory moved into a new one, holding an
+	// entry created with the switch on
+	if err := d.MakeDir(ctx, parent, "new"); err != nil {
+		t.Fatalf("MakeDir(new): %v", err)
+	}
+	newShort := shortName(d.cipher.EncryptDirName("new"))
+	movedEnc := d.cipher.EncryptDirName("moved")
+	if err := os.Mkdir(filepath.Join(dataDir, newShort, movedEnc), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	movedDir := &model.Object{Path: stdpath.Join(remotePath, newShort, movedEnc), Name: movedEnc, IsFolder: true}
+	if err := d.MakeDir(ctx, movedDir, "inner"); err != nil {
+		t.Fatalf("MakeDir(inner): %v", err)
+	}
+
+	// every directory opens, whatever mix of names its path has
+	for _, p := range []string{"/old", "/old/fresh", "/new/moved", "/new/moved/inner"} {
+		if _, err := fs.List(ctx, mount+p, &fs.ListArgs{NoLog: true}); err != nil {
+			t.Errorf("List(%s): %v", p, err)
+		}
+	}
+
+	// the old file opens and downloads
+	fileObj, err := fs.Get(ctx, mount+"/old/old.txt", &fs.GetArgs{NoLog: true})
+	if err != nil {
+		t.Fatalf("Get(old.txt): %v", err)
+	}
+	if fileObj.GetName() != "old.txt" || fileObj.GetSize() != int64(len(contents)) {
+		t.Errorf("old.txt resolved as %q with %d bytes", fileObj.GetName(), fileObj.GetSize())
+	}
+	link, err := d.Link(ctx, fileObj, model.LinkArgs{})
+	if err != nil {
+		t.Fatalf("Link(old.txt): %v", err)
+	}
+	defer link.Close()
+	rc, err := link.RangeReader.RangeRead(ctx, http_range.Range{Start: 0, Length: -1})
+	if err != nil {
+		t.Fatalf("RangeRead(old.txt): %v", err)
+	}
+	defer rc.Close()
+	downloaded, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read old.txt: %v", err)
+	}
+	if string(downloaded) != contents {
+		t.Errorf("downloaded %q, want %q", downloaded, contents)
+	}
+
+	// so do the index files of the old directories
+	for _, p := range []string{"/old/" + indexFileName, "/new/moved/" + indexFileName} {
+		if _, err := fs.Get(ctx, mount+p, &fs.GetArgs{NoLog: true}); err != nil {
+			t.Errorf("Get(%s): %v", p, err)
+		}
+	}
+
+	// entries that do not exist are still reported as missing
+	for _, p := range []string{"/old/missing.txt", "/new/moved/missing"} {
+		if _, err := fs.Get(ctx, mount+p, &fs.GetArgs{NoLog: true}); !errs.IsObjectNotFound(err) {
+			t.Errorf("Get(%s) = %v, want object not found", p, err)
+		}
+	}
+
+	// creating a directory that exists under its full name keeps it instead of
+	// adding a shortened twin
+	if err := fs.MakeDir(ctx, mount+"/old"); err != nil {
+		t.Fatalf("MakeDir(old): %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, shortName(oldEnc))); err == nil {
+		t.Errorf("MakeDir created a shortened twin of an existing directory")
 	}
 }

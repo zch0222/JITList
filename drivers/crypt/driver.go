@@ -156,27 +156,32 @@ func (d *Crypt) Get(ctx context.Context, path string) (model.Obj, error) {
 	if stdpath.Base(path) == indexFileName {
 		return d.getIndexFile(ctx, path)
 	}
-	firstTryIsFolder, secondTry := guessPath(path)
-	remoteFullPath := stdpath.Join(d.RemotePath, d.encryptPath(path, firstTryIsFolder))
+	candidates := d.remotePathCandidates(path)
+	remoteFullPath := stdpath.Join(d.RemotePath, candidates[0])
 	remoteObj, err := fs.Get(ctx, remoteFullPath, &fs.GetArgs{NoLog: true})
-	if err != nil {
-		if errors.Is(err, errs.StorageNotFound) {
-			remoteFullPath = stdpath.Join(d.RemotePath, path)
-			remoteObj, err = fs.Get(ctx, remoteFullPath, &fs.GetArgs{NoLog: true})
-			if err != nil {
-				// 可能是 虚拟路径+开启文件夹加密：返回NotSupport让op.Get去尝试op.List查找
-				return nil, errs.NotSupport
-			}
-		} else if secondTry && errs.IsObjectNotFound(err) {
-			// try the opposite
-			remoteFullPath = stdpath.Join(d.RemotePath, d.encryptPath(path, !firstTryIsFolder))
-			remoteObj, err = fs.Get(ctx, remoteFullPath, &fs.GetArgs{NoLog: true})
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
+	if errors.Is(err, errs.StorageNotFound) {
+		remoteFullPath = stdpath.Join(d.RemotePath, path)
+		remoteObj, err = fs.Get(ctx, remoteFullPath, &fs.GetArgs{NoLog: true})
+		if err != nil {
+			// 可能是 虚拟路径+开启文件夹加密：返回NotSupport让op.Get去尝试op.List查找
+			return nil, errs.NotSupport
 		}
+	}
+	for _, candidate := range candidates[1:] {
+		if !errs.IsObjectNotFound(err) {
+			break
+		}
+		remoteFullPath = stdpath.Join(d.RemotePath, candidate)
+		remoteObj, err = fs.Get(ctx, remoteFullPath, &fs.GetArgs{NoLog: true})
+	}
+	if err != nil {
+		if errs.IsObjectNotFound(err) && d.dirShorteningActive() {
+			// a path mixing short and full directory names matches none of the
+			// candidates: let op.Get find the entry in the listing of its
+			// parent, which resolves both
+			return nil, errs.NotSupport
+		}
+		return nil, err
 	}
 
 	size := remoteObj.GetSize()

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	stdpath "path"
+	"slices"
 	"strings"
 	"testing"
 
@@ -244,6 +245,20 @@ func TestUpdateIndex(t *testing.T) {
 	}
 }
 
+// encryptedTestData builds the remote content of a file holding plain
+func encryptedTestData(t *testing.T, d *Crypt, plain []byte) []byte {
+	t.Helper()
+	encReader, err := d.cipher.EncryptData(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("encrypt data: %v", err)
+	}
+	data, err := io.ReadAll(encReader)
+	if err != nil {
+		t.Fatalf("read encrypted data: %v", err)
+	}
+	return data
+}
+
 // encryptedTestIndex builds the remote content of an index file
 func encryptedTestIndex(t *testing.T, d *Crypt, names map[string]string) []byte {
 	t.Helper()
@@ -251,15 +266,7 @@ func encryptedTestIndex(t *testing.T, d *Crypt, names map[string]string) []byte 
 	if err != nil {
 		t.Fatalf("marshal index: %v", err)
 	}
-	encReader, err := d.cipher.EncryptData(bytes.NewReader(plain))
-	if err != nil {
-		t.Fatalf("encrypt index: %v", err)
-	}
-	data, err := io.ReadAll(encReader)
-	if err != nil {
-		t.Fatalf("read encrypted index: %v", err)
-	}
-	return data
+	return encryptedTestData(t, d, plain)
 }
 
 func TestIndexNamePreference(t *testing.T) {
@@ -462,7 +469,7 @@ func TestResolveListingShortNames(t *testing.T) {
 	}
 }
 
-func TestIndexRemotePath(t *testing.T) {
+func TestIndexRemotePaths(t *testing.T) {
 	d := newTestCrypt(t, "standard", "true", true, newMemIO())
 	d.RemotePath = "/remote"
 	encName, plainName := d.indexFileNames()[0], d.indexFileNames()[1]
@@ -470,28 +477,71 @@ func TestIndexRemotePath(t *testing.T) {
 		t.Fatalf("index names = %q, %q; want the encrypted name first, then the plain one", encName, plainName)
 	}
 
-	// the encrypted name is used in the remote root
-	if got, want := d.indexRemotePath("/"+indexFileName, encName), "/remote/"+encName; got != want {
-		t.Errorf("root index path = %q, want %q", got, want)
+	// in the remote root the encrypted name is looked up before the plain one
+	// of files written by earlier versions
+	want := []string{"/remote/" + encName, "/remote/" + plainName}
+	if got := d.indexRemotePaths("/" + indexFileName); !slices.Equal(got, want) {
+		t.Errorf("root index paths = %q, want %q", got, want)
 	}
 
-	// the plain name is still addressable for files of earlier versions
-	if got, want := d.indexRemotePath("/"+indexFileName, plainName), "/remote/"+plainName; got != want {
-		t.Errorf("legacy index path = %q, want %q", got, want)
-	}
-
-	// in a subdirectory the directory segments are encrypted and shortened
+	// in a subdirectory the directory segments are encrypted and shortened,
+	// then kept in full for directories written while the switch was off
 	subEnc := d.cipher.EncryptDirName("sub")
-	want := "/remote/" + shortName(subEnc) + "/" + encName
-	if got := d.indexRemotePath("/sub/"+indexFileName, encName); got != want {
-		t.Errorf("nested index path = %q, want %q", got, want)
+	want = []string{
+		"/remote/" + shortName(subEnc) + "/" + encName,
+		"/remote/" + shortName(subEnc) + "/" + plainName,
+		"/remote/" + subEnc + "/" + encName,
+		"/remote/" + subEnc + "/" + plainName,
+	}
+	if got := d.indexRemotePaths("/sub/" + indexFileName); !slices.Equal(got, want) {
+		t.Errorf("nested index paths = %q, want %q", got, want)
 	}
 
 	// with directory encryption off the segments stay plain
 	plain := newTestCrypt(t, "standard", "false", true, newMemIO())
 	plain.RemotePath = "/remote"
-	if got, want := plain.indexRemotePath("/sub/"+indexFileName, plainName), "/remote/sub/"+plainName; got != want {
-		t.Errorf("plain dir index path = %q, want %q", got, want)
+	want = []string{"/remote/sub/" + plain.indexFileNames()[0], "/remote/sub/" + plainName}
+	if got := plain.indexRemotePaths("/sub/" + indexFileName); !slices.Equal(got, want) {
+		t.Errorf("plain dir index paths = %q, want %q", got, want)
+	}
+}
+
+func TestRemotePathCandidates(t *testing.T) {
+	d := newTestCrypt(t, "standard", "true", true, newMemIO())
+	encA, encB := d.cipher.EncryptDirName("a"), d.cipher.EncryptDirName("b")
+
+	// the short names are looked up first, then the full encrypted names of
+	// entries written while the switch was off; directory and file names
+	// encrypt alike, so both guesses share these paths
+	want := []string{
+		"/" + shortName(encA) + "/" + shortName(encB),
+		"/" + encA + "/" + encB,
+	}
+	if got := d.remotePathCandidates("/a/b"); !slices.Equal(got, want) {
+		t.Errorf("candidates = %q, want %q", got, want)
+	}
+
+	// with the switch off only the full names exist
+	off := newTestCrypt(t, "standard", "true", false, newMemIO())
+	want = []string{"/" + encA + "/" + encB}
+	if got := off.remotePathCandidates("/a/b"); !slices.Equal(got, want) {
+		t.Errorf("switch off candidates = %q, want %q", got, want)
+	}
+
+	// with directory encryption off, a name without a dot is first guessed to
+	// be a plain directory, then a file under its short and full names
+	plain := newTestCrypt(t, "standard", "false", true, newMemIO())
+	encFileB := plain.cipher.EncryptFileName("b")
+	want = []string{"/a/b", "/a/" + shortName(encFileB), "/a/" + encFileB}
+	if got := plain.remotePathCandidates("/a/b"); !slices.Equal(got, want) {
+		t.Errorf("plain dir candidates = %q, want %q", got, want)
+	}
+
+	// and a name with a dot is first guessed to be a file
+	encFileTxt := plain.cipher.EncryptFileName("b.txt")
+	want = []string{"/a/" + shortName(encFileTxt), "/a/" + encFileTxt, "/a/b.txt"}
+	if got := plain.remotePathCandidates("/a/b.txt"); !slices.Equal(got, want) {
+		t.Errorf("plain dir file candidates = %q, want %q", got, want)
 	}
 }
 
